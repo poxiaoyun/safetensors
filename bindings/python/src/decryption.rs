@@ -92,6 +92,20 @@ pub fn create_encrypted_source(filename: &Path) -> PyResult<Option<(usize, Metad
 
                     let n = u64::from_le_bytes(size_buffer) as usize;
 
+                    // Validate header size
+                    // 1. Check against a reasonable absolute limit (e.g., 100MB)
+                    // 2. Check against file size
+                    let file_size = file.metadata().map_err(|e| {
+                        SafetensorError::new_err(format!("Error getting file metadata: {e}"))
+                    })?.len();
+
+                    if n as u64 > 100 * 1024 * 1024 || n as u64 > file_size {
+                         return Err(SafetensorError::new_err(format!(
+                            "Header too large ({} bytes). This likely means decryption failed due to incorrect key/IV, or the file is not actually encrypted.",
+                            n
+                        )));
+                    }
+
                     // Read header
                     let mut header_buffer = vec![0u8; n];
                     file.read_exact(&mut header_buffer).map_err(|e| {

@@ -503,6 +503,24 @@ struct Open {
 
 impl Open {
     fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
+        Python::with_gil(|py| -> PyResult<()> {
+            match framework {
+                Framework::Pytorch => {
+                    let module = PyModule::import(py, intern!(py, "torch"))?;
+                    TORCH_MODULE.get_or_init_py_attached(py, || module.into());
+                }
+                Framework::Paddle => {
+                    let module = PyModule::import(py, intern!(py, "paddle"))?;
+                    PADDLE_MODULE.get_or_init_py_attached(py, || module.into());
+                }
+                _ => {
+                    let module = PyModule::import(py, intern!(py, "numpy"))?;
+                    NUMPY_MODULE.get_or_init_py_attached(py, || module.into());
+                }
+            };
+            Ok(())
+        })?;
+
         let mut encrypted_source: Option<EncryptedSource> = None;
         let mut metadata_info: Option<(usize, Metadata)> = None;
 
@@ -631,24 +649,6 @@ impl Open {
         };
 
         let offset = n + 8;
-        Python::with_gil(|py| -> PyResult<()> {
-            match framework {
-                Framework::Pytorch => {
-                    let module = PyModule::import(py, intern!(py, "torch"))?;
-                    TORCH_MODULE.get_or_init_py_attached(py, || module.into())
-                }
-                Framework::Paddle => {
-                    let module = PyModule::import(py, intern!(py, "paddle"))?;
-                    PADDLE_MODULE.get_or_init_py_attached(py, || module.into())
-                }
-                _ => {
-                    let module = PyModule::import(py, intern!(py, "numpy"))?;
-                    NUMPY_MODULE.get_or_init_py_attached(py, || module.into())
-                }
-            };
-
-            Ok(())
-        })?;
 
         let storage = Arc::new(storage);
         let device = device.unwrap_or(Device::Cpu);
