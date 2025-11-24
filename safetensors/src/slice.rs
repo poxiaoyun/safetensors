@@ -385,6 +385,94 @@ impl<'data> SliceIterator<'data> {
     }
 }
 
+/// Calculate the byte ranges for a slice without needing the data
+pub fn calculate_slice_indices(
+    shape: &[usize],
+    dtype: crate::tensor::Dtype,
+    slices: &[TensorIndexer],
+) -> Result<(Vec<(usize, usize)>, Vec<usize>), InvalidSlice> {
+    let mut indices = Vec::new();
+    let mut newshape = Vec::with_capacity(shape.len());
+    let mut span = dtype.bitsize();
+    let default_slice = TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded);
+    for (i, shape) in shape.iter().enumerate().rev() {
+        let slice = slices.get(i).unwrap_or(&default_slice);
+        let (start, stop) = match slice {
+            TensorIndexer::Narrow(Bound::Unbounded, Bound::Unbounded) => (0, *shape),
+            TensorIndexer::Narrow(Bound::Excluded(s), Bound::Included(stop)) => {
+                (*s + 1, *stop + 1)
+            }
+            TensorIndexer::Narrow(Bound::Unbounded, Bound::Excluded(stop)) => (0, *stop),
+            TensorIndexer::Narrow(Bound::Unbounded, Bound::Included(stop)) => {
+                (0, *stop + 1)
+            }
+            TensorIndexer::Narrow(Bound::Included(s), Bound::Unbounded) => (*s, *shape),
+            TensorIndexer::Narrow(Bound::Included(s), Bound::Excluded(stop)) => (*s, *stop),
+            TensorIndexer::Narrow(Bound::Included(s), Bound::Included(stop)) => {
+                (*s, *stop + 1)
+            }
+            TensorIndexer::Narrow(Bound::Excluded(s), Bound::Unbounded) => (*s + 1, *shape),
+            TensorIndexer::Narrow(Bound::Excluded(s), Bound::Excluded(stop)) => {
+                (*s + 1, *stop)
+            }
+            TensorIndexer::Select(s) => (*s, *s + 1),
+        };
+        if start >= *shape || stop > *shape {
+            let asked = if start >= *shape {
+                start
+            } else {
+                stop.saturating_sub(1)
+            };
+            return Err(InvalidSlice::SliceOutOfRange {
+                dim_index: i,
+                asked,
+                dim_size: *shape,
+            });
+        }
+        if let TensorIndexer::Narrow(..) = slice {
+            newshape.push(stop - start);
+        }
+        if indices.is_empty() {
+            if start == 0 && stop == *shape {
+                // We haven't started to slice yet, just increase the span
+            } else {
+                if start * span % 8 != 0 {
+                    return Err(InvalidSlice::MisalignedSlice);
+                }
+                let offset = (start * span) / 8;
+                if stop * span % 8 != 0 {
+                    return Err(InvalidSlice::MisalignedSlice);
+                }
+                let small_span = (stop * span) / 8 - offset;
+                indices.push((offset, offset + small_span));
+            }
+        } else {
+            let capacity = (stop - start) * indices.len();
+            let mut newindices = Vec::with_capacity(capacity);
+            for n in start..stop {
+                if n * span % 8 != 0 {
+                    return Err(InvalidSlice::MisalignedSlice);
+                }
+                let offset = (n * span) / 8;
+                for (old_start, old_stop) in &indices {
+                    newindices.push((old_start + offset, old_stop + offset));
+                }
+            }
+            indices = newindices;
+        }
+        span *= shape;
+    }
+    if indices.is_empty() {
+        // Full tensor
+        let total_bytes = (span + 7) / 8;
+        indices.push((0, total_bytes));
+    }
+    // Reversing so we can pop faster while iterating on the slice
+    let indices = indices.into_iter().rev().collect();
+    let newshape = newshape.into_iter().rev().collect();
+    Ok((indices, newshape))
+}
+
 impl<'data> Iterator for SliceIterator<'data> {
     type Item = &'data [u8];
 

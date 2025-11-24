@@ -9,15 +9,45 @@ use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyList, PySlice};
 use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
+use safetensors::slice::calculate_slice_indices;
 use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
 use safetensors::View;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
+// use std::io::{Read, Seek, SeekFrom};
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+// use aes::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+// use aes::Aes256;
+// use ctr::Ctr128BE;
+// use serde::Deserialize;
+use std::env;
+
+mod decryption;
+use decryption::EncryptedSource;
+
+// type Aes256Ctr = Ctr128BE<Aes256>;
+
+// #[derive(Deserialize)]
+// struct EncryptedFile {
+//     file: String,
+//     key: String,
+//     iv: String,
+// }
+
+// struct EncryptedSource {
+//     file: Mutex<File>,
+//     key: Vec<u8>,
+//     iv: Vec<u8>,
+// }
+
+// #[derive(Deserialize)]
+// struct EncryptionConfig {
+//     files: Vec<EncryptedFile>,
+// }
 
 static TORCH_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static NUMPY_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
@@ -198,11 +228,40 @@ fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String
     Ok(items)
 }
 
+/// Sets the decryption configuration from a JSON string.
+///
+/// Args:
+///     config_json (`str`):
+///         The JSON string containing the encryption configuration.
+///
+/// Returns:
+///     (`NoneType`):
+///         On success return None
+#[pyfunction]
+#[pyo3(signature = (config_json))]
+fn set_decryption_config(config_json: String) -> PyResult<()> {
+    decryption::load_global_config_from_json(&config_json)
+        .map_err(|e| SafetensorError::new_err(format!("Invalid config JSON: {e}")))?;
+    Ok(())
+}
+
 fn slice_to_indexer(
     (dim_idx, (slice_index, dim)): (usize, (SliceIndex, usize)),
 ) -> Result<TensorIndexer, PyErr> {
     match slice_index {
         SliceIndex::Slice(slice) => {
+            let py_step = slice.getattr(intern!(slice.py(), "step"))?;
+            if !py_step.is_none() {
+                let step: Option<isize> = py_step.extract()?;
+                if let Some(step) = step {
+                    if step != 1 {
+                        return Err(SafetensorError::new_err(format!(
+                            "Step slicing is not supported (got step={step})"
+                        )));
+                    }
+                }
+            }
+
             let py_start = slice.getattr(intern!(slice.py(), "start"))?;
             let start: Option<usize> = py_start.extract()?;
             let start = if let Some(start) = start {
@@ -379,6 +438,7 @@ impl<'py> IntoPyObject<'py> for Device {
 
 enum Storage {
     Mmap(Mmap),
+    Encrypted(EncryptedSource),
     /// Torch specific mmap
     /// This allows us to not manage it
     /// so Pytorch can handle the whole lifecycle.
@@ -443,29 +503,132 @@ struct Open {
 
 impl Open {
     fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
-        let file = File::open(&filename).map_err(|_| {
-            PyFileNotFoundError::new_err(format!(
-                "No such file or directory: {}",
-                filename.display()
-            ))
-        })?;
-        let device = device.unwrap_or(Device::Cpu);
-        if device != Device::Cpu
-            && framework != Framework::Pytorch
-            && framework != Framework::Paddle
-        {
-            return Err(SafetensorError::new_err(format!(
-                "Device {device} is not supported for framework {framework}",
-            )));
+        let mut encrypted_source: Option<EncryptedSource> = None;
+        let mut metadata_info: Option<(usize, Metadata)> = None;
+
+        if let Some((n, metadata, source)) = decryption::create_encrypted_source(&filename)? {
+            metadata_info = Some((n, metadata));
+            encrypted_source = Some(source);
         }
 
-        // SAFETY: Mmap is used to prevent allocating in Rust
-        // before making a copy within Python.
-        let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
+        let (n, metadata, storage) = if let Some((n, metadata)) = metadata_info {
+            (n, metadata, Storage::Encrypted(encrypted_source.unwrap()))
+        } else {
+            let file = File::open(&filename).map_err(|_| {
+                PyFileNotFoundError::new_err(format!(
+                    "No such file or directory: {}",
+                    filename.display()
+                ))
+            })?;
+            let device_check = device.clone().unwrap_or(Device::Cpu);
+            if device_check != Device::Cpu
+                && framework != Framework::Pytorch
+                && framework != Framework::Paddle
+            {
+                return Err(SafetensorError::new_err(format!(
+                    "Device {device_check} is not supported for framework {framework}",
+                )));
+            }
 
-        let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
-            SafetensorError::new_err(format!("Error while deserializing header: {e}"))
-        })?;
+            // SAFETY: Mmap is used to prevent allocating in Rust
+            // before making a copy within Python.
+            let buffer = unsafe { MmapOptions::new().map_copy_read_only(&file)? };
+
+            let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
+                SafetensorError::new_err(format!("Error while deserializing header: {e}"))
+            })?;
+            
+            let storage = match &framework {
+                Framework::Paddle => Python::with_gil(|py| -> PyResult<Storage> {
+                    let paddle = get_module(py, &PADDLE_MODULE)?;
+                    let version: String = paddle.getattr(intern!(py, "__version__"))?.extract()?;
+                    let version = Version::from_string(&version).map_err(SafetensorError::new_err)?;
+
+                    // todo: version check, only paddle 3.1.1 or develop
+                    if version >= Version::new(3, 1, 1) || version == Version::new(0, 0, 0) {
+                        let py_filename: PyObject = filename
+                            .to_str()
+                            .ok_or_else(|| {
+                                SafetensorError::new_err(format!(
+                                    "Path {} is not valid UTF-8",
+                                    filename.display()
+                                ))
+                            })?
+                            .into_pyobject(py)?
+                            .into();
+                        let size: PyObject = buffer.len().into_pyobject(py)?.into();
+                        let init_kargs = [
+                            (intern!(py, "filename"), py_filename),
+                            (intern!(py, "nbytes"), size),
+                        ]
+                        .into_py_dict(py)?;
+                        let storage = paddle
+                            .getattr(intern!(py, "MmapStorage"))?
+                            .call((), Some(&init_kargs))?
+                            .into_pyobject(py)?
+                            .into();
+                        let gil_storage = OnceLock::new();
+                        gil_storage.get_or_init_py_attached(py, || storage);
+                        Ok(Storage::Paddle(gil_storage))
+                    } else {
+                        let module = PyModule::import(py, intern!(py, "numpy"))?;
+                        NUMPY_MODULE.get_or_init_py_attached(py, || module.into());
+                        Ok(Storage::Mmap(buffer))
+                    }
+                })?,
+                Framework::Pytorch => Python::with_gil(|py| -> PyResult<Storage> {
+                    let module = get_module(py, &TORCH_MODULE)?;
+
+                    let version: String = module.getattr(intern!(py, "__version__"))?.extract()?;
+                    let version = Version::from_string(&version).map_err(SafetensorError::new_err)?;
+
+                    // Untyped storage only exists for versions over 1.11.0
+                    // Same for torch.asarray which is necessary for zero-copy tensor
+                    if version >= Version::new(1, 11, 0) {
+                        // storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
+                        let py_filename: PyObject = filename
+                            .to_str()
+                            .ok_or_else(|| {
+                                SafetensorError::new_err(format!(
+                                    "Path {} is not valid UTF-8",
+                                    filename.display()
+                                ))
+                            })?
+                            .into_pyobject(py)?
+                            .into();
+                        let size: PyObject = buffer.len().into_pyobject(py)?.into();
+                        let shared: PyObject = PyBool::new(py, false).to_owned().into();
+                        let (size_name, storage_name) = if version >= Version::new(2, 0, 0) {
+                            (intern!(py, "nbytes"), intern!(py, "UntypedStorage"))
+                        } else {
+                            (intern!(py, "size"), intern!(py, "ByteStorage"))
+                        };
+
+                        let kwargs =
+                            [(intern!(py, "shared"), shared), (size_name, size)].into_py_dict(py)?;
+                        let storage = module
+                            .getattr(storage_name)?
+                            // .getattr(intern!(py, "from_file"))?
+                            .call_method("from_file", (py_filename,), Some(&kwargs))?;
+
+                        let untyped: PyBound<'_, PyAny> = match storage.getattr(intern!(py, "untyped"))
+                        {
+                            Ok(untyped) => untyped,
+                            Err(_) => storage.getattr(intern!(py, "_untyped"))?,
+                        };
+                        let storage = untyped.call0()?.into_pyobject(py)?.into();
+                        let gil_storage = OnceLock::new();
+                        gil_storage.get_or_init_py_attached(py, || storage);
+
+                        Ok(Storage::Torch(gil_storage))
+                    } else {
+                        Ok(Storage::Mmap(buffer))
+                    }
+                })?,
+                _ => Storage::Mmap(buffer),
+            };
+            (n, metadata, storage)
+        };
 
         let offset = n + 8;
         Python::with_gil(|py| -> PyResult<()> {
@@ -487,97 +650,8 @@ impl Open {
             Ok(())
         })?;
 
-        let storage = match &framework {
-            Framework::Paddle => Python::with_gil(|py| -> PyResult<Storage> {
-                let paddle = get_module(py, &PADDLE_MODULE)?;
-                let version: String = paddle.getattr(intern!(py, "__version__"))?.extract()?;
-                let version = Version::from_string(&version).map_err(SafetensorError::new_err)?;
-
-                // todo: version check, only paddle 3.1.1 or develop
-                if version >= Version::new(3, 1, 1) || version == Version::new(0, 0, 0) {
-                    let py_filename: PyObject = filename
-                        .to_str()
-                        .ok_or_else(|| {
-                            SafetensorError::new_err(format!(
-                                "Path {} is not valid UTF-8",
-                                filename.display()
-                            ))
-                        })?
-                        .into_pyobject(py)?
-                        .into();
-                    let size: PyObject = buffer.len().into_pyobject(py)?.into();
-                    let init_kargs = [
-                        (intern!(py, "filename"), py_filename),
-                        (intern!(py, "nbytes"), size),
-                    ]
-                    .into_py_dict(py)?;
-                    let storage = paddle
-                        .getattr(intern!(py, "MmapStorage"))?
-                        .call((), Some(&init_kargs))?
-                        .into_pyobject(py)?
-                        .into();
-                    let gil_storage = OnceLock::new();
-                    gil_storage.get_or_init_py_attached(py, || storage);
-                    Ok(Storage::Paddle(gil_storage))
-                } else {
-                    let module = PyModule::import(py, intern!(py, "numpy"))?;
-                    NUMPY_MODULE.get_or_init_py_attached(py, || module.into());
-                    Ok(Storage::Mmap(buffer))
-                }
-            })?,
-            Framework::Pytorch => Python::with_gil(|py| -> PyResult<Storage> {
-                let module = get_module(py, &TORCH_MODULE)?;
-
-                let version: String = module.getattr(intern!(py, "__version__"))?.extract()?;
-                let version = Version::from_string(&version).map_err(SafetensorError::new_err)?;
-
-                // Untyped storage only exists for versions over 1.11.0
-                // Same for torch.asarray which is necessary for zero-copy tensor
-                if version >= Version::new(1, 11, 0) {
-                    // storage = torch.ByteStorage.from_file(filename, shared=False, size=size).untyped()
-                    let py_filename: PyObject = filename
-                        .to_str()
-                        .ok_or_else(|| {
-                            SafetensorError::new_err(format!(
-                                "Path {} is not valid UTF-8",
-                                filename.display()
-                            ))
-                        })?
-                        .into_pyobject(py)?
-                        .into();
-                    let size: PyObject = buffer.len().into_pyobject(py)?.into();
-                    let shared: PyObject = PyBool::new(py, false).to_owned().into();
-                    let (size_name, storage_name) = if version >= Version::new(2, 0, 0) {
-                        (intern!(py, "nbytes"), intern!(py, "UntypedStorage"))
-                    } else {
-                        (intern!(py, "size"), intern!(py, "ByteStorage"))
-                    };
-
-                    let kwargs =
-                        [(intern!(py, "shared"), shared), (size_name, size)].into_py_dict(py)?;
-                    let storage = module
-                        .getattr(storage_name)?
-                        // .getattr(intern!(py, "from_file"))?
-                        .call_method("from_file", (py_filename,), Some(&kwargs))?;
-
-                    let untyped: PyBound<'_, PyAny> = match storage.getattr(intern!(py, "untyped"))
-                    {
-                        Ok(untyped) => untyped,
-                        Err(_) => storage.getattr(intern!(py, "_untyped"))?,
-                    };
-                    let storage = untyped.call0()?.into_pyobject(py)?.into();
-                    let gil_storage = OnceLock::new();
-                    gil_storage.get_or_init_py_attached(py, || storage);
-
-                    Ok(Storage::Torch(gil_storage))
-                } else {
-                    Ok(Storage::Mmap(buffer))
-                }
-            })?,
-            _ => Storage::Mmap(buffer),
-        };
-
         let storage = Arc::new(storage);
+        let device = device.unwrap_or(Device::Cpu);
 
         Ok(Self {
             metadata,
@@ -659,91 +733,23 @@ impl Open {
                     &self.device,
                 )
             }
-            Storage::Paddle(storage) => {
-                Python::with_gil(|py| -> PyResult<PyObject> {
-                    let paddle = get_module(py, &PADDLE_MODULE)?;
-                    let cur_type = if info.dtype == Dtype::U16 {
-                        Dtype::BF16
-                    } else {
-                        info.dtype
-                    };
-                    let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
-                    let paddle_uint8: PyObject = get_pydtype(paddle, Dtype::U8, false)?;
-                    let mut shape = info.shape.to_vec();
-                    if cur_type == Dtype::F4 {
-                        let n = shape.len();
-                        if shape[n - 1] % 2 != 0 {
-                            return Err(SafetensorError::new_err(format!(
-                        "f4_x2 dtype requires that the last dim be divisible by 2 in torch: got {shape:?}",
-                                )));
-                        }
-                        shape[n - 1] /= 2;
-                    }
-                    let shape: PyObject = shape.into_pyobject(py)?.into();
-                    let start = (info.data_offsets.0 + self.offset) as isize;
-                    let stop = (info.data_offsets.1 + self.offset) as isize;
+            Storage::Encrypted(source) => {
+                let start = info.data_offsets.0 + self.offset;
+                let end = info.data_offsets.1 + self.offset;
+                let len = end - start;
+                
+                let buffer = decryption::decrypt_buffer(source, start, len)?;
 
-                    let kwargs = [
-                        (intern!(py, "dtype"), paddle_uint8),
-                        (intern!(py, "start"), start.into_pyobject(py)?.into()),
-                        (intern!(py, "stop"), stop.into_pyobject(py)?.into()),
-                    ]
-                    .into_py_dict(py)?;
-                    let sys = PyModule::import(py, intern!(py, "sys"))?;
-                    let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
-                    let storage: &PyObject = storage
-                        .get()
-                        .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
-                    let storage: &PyBound<PyAny> = storage.bind(py);
-                    let storage_slice = storage
-                        .getattr(intern!(py, "get_slice"))?
-                        .call((), Some(&kwargs))?;
-                    let mut tensor = storage_slice
-                        .getattr(intern!(py, "view"))?
-                        .call1((dtype,))?;
+                let array: PyObject =
+                    Python::with_gil(|py| PyByteArray::new(py, &buffer).into_any().into());
 
-                    if byteorder == "big" {
-                        let inplace_kwargs =
-                            [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
-
-                        let intermediary_dtype = match cur_type {
-                            Dtype::BF16 => Some(Dtype::F16),
-                            Dtype::F8_E5M2 => Some(Dtype::U8),
-                            Dtype::F8_E4M3 => Some(Dtype::U8),
-                            Dtype::F8_E8M0 => Some(Dtype::U8),
-                            _ => None,
-                        };
-                        if let Some(intermediary_dtype) = intermediary_dtype {
-                            // Reinterpret to f16 for numpy compatibility.
-                            let dtype: PyObject = get_pydtype(paddle, intermediary_dtype, false)?;
-                            tensor = tensor.getattr(intern!(py, "view"))?.call1((dtype,))?;
-                        }
-                        let numpy = tensor
-                            .getattr(intern!(py, "numpy"))?
-                            .call0()?
-                            .getattr("byteswap")?
-                            .call((), Some(&inplace_kwargs))?;
-                        tensor = paddle.getattr(intern!(py, "to_tensor"))?.call1((numpy,))?;
-                        if intermediary_dtype.is_some() {
-                            // Reinterpret to f16 for numpy compatibility.
-                            let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
-                            tensor = tensor.getattr(intern!(py, "view"))?.call1((dtype,))?;
-                        }
-                    }
-
-                    if self.device != Device::Cpu {
-                        let device: PyObject = if let Device::Cuda(index) = self.device {
-                            format!("gpu:{index}").into_pyobject(py)?.into()
-                        } else {
-                            self.device.clone().into_pyobject(py)?.into()
-                        };
-                        let kwargs = PyDict::new(py);
-                        tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
-                    }
-
-                    let tensor = tensor.getattr(intern!(py, "reshape"))?.call1((shape,))?;
-                    Ok(tensor.into_pyobject(py)?.into())
-                })
+                create_tensor(
+                    &self.framework,
+                    info.dtype,
+                    &info.shape,
+                    array,
+                    &self.device,
+                )
             }
             Storage::Torch(storage) => {
                 Python::with_gil(|py| -> PyResult<PyObject> {
@@ -775,7 +781,7 @@ impl Open {
                     let storage: &PyObject = storage
                         .get()
                         .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
-                    let storage: &PyBound<PyAny> = storage.bind(py);
+                    let storage: &PyBound<'_, PyAny> = storage.bind(py);
                     let storage_slice = storage
                         .getattr(intern!(py, "__getitem__"))?
                         .call1((slice,))?;
@@ -828,6 +834,7 @@ impl Open {
                     Ok(tensor.into_pyobject(py)?.into())
                 })
             }
+            Storage::Paddle(_) => todo!(),
         }
     }
 
@@ -1019,6 +1026,34 @@ impl fmt::Display for Disp {
     }
 }
 
+fn extract_slices<'a>(pyslices: &'a PyBound<'a, PyAny>) -> PyResult<Vec<SliceIndex<'a>>> {
+    if pyslices.is(&pyslices.py().Ellipsis().bind(pyslices.py())) {
+        let slice_type = pyslices.py().get_type::<PySlice>();
+        let full_slice = slice_type
+            .call1((pyslices.py().None(),))?
+            .downcast::<PySlice>()?
+            .clone();
+        Ok(vec![SliceIndex::Slice(full_slice)])
+    } else {
+        let slices: Slice = pyslices.extract()?;
+        let is_list = pyslices.is_instance_of::<PyList>();
+        match slices {
+            Slice::Slice(slice) => Ok(vec![slice]),
+            Slice::Slices(slices) => {
+                if slices.is_empty() && is_list {
+                    Ok(vec![SliceIndex::Slice(PySlice::new(pyslices.py(), 0, 0, 0))])
+                } else if is_list {
+                    Err(SafetensorError::new_err(
+                        "Non empty lists are not implemented",
+                    ))
+                } else {
+                    Ok(slices)
+                }
+            }
+        }
+    }
+}
+
 #[pymethods]
 impl PySafeSlice {
     /// Returns the shape of the full underlying tensor
@@ -1064,23 +1099,7 @@ impl PySafeSlice {
     pub fn __getitem__(&self, slices: &PyBound<'_, PyAny>) -> PyResult<PyObject> {
         match &self.storage.as_ref() {
             Storage::Mmap(mmap) => {
-                let pyslices = slices;
-                let slices: Slice = pyslices.extract()?;
-                let is_list = pyslices.is_instance_of::<PyList>();
-                let slices: Vec<SliceIndex> = match slices {
-                    Slice::Slice(slice) => vec![slice],
-                    Slice::Slices(slices) => {
-                        if slices.is_empty() && is_list {
-                            vec![SliceIndex::Slice(PySlice::new(pyslices.py(), 0, 0, 0))]
-                        } else if is_list {
-                            return Err(SafetensorError::new_err(
-                                "Non empty lists are not implemented",
-                            ));
-                        } else {
-                            slices
-                        }
-                    }
-                };
+                let slices = extract_slices(slices)?;
                 let data = &mmap[self.info.data_offsets.0 + self.offset
                     ..self.info.data_offsets.1 + self.offset];
 
@@ -1129,13 +1148,59 @@ impl PySafeSlice {
                     )
                 })
             }
+            Storage::Encrypted(source) => {
+                let slices = extract_slices(slices)?;
+
+                let shape = self.info.shape.clone();
+                let slices: Vec<TensorIndexer> = slices
+                    .into_iter()
+                    .zip(shape.clone())
+                    .enumerate()
+                    .map(slice_to_indexer)
+                    .collect::<Result<_, _>>()?;
+
+                let (mut indices, newshape) = calculate_slice_indices(&shape, self.info.dtype, &slices)
+                    .map_err(|e| SafetensorError::new_err(format!("Error calculating slice indices: {e}")))?;
+                
+                // calculate_slice_indices reverses the indices for efficient popping.
+                // We need them in forward order.
+                indices.reverse();
+
+                let tensor_start_offset = self.info.data_offsets.0 + self.offset;
+                let buffer = decryption::decrypt_slices(source, tensor_start_offset, indices)?;
+
+                let array: PyObject =
+                    Python::with_gil(|py| PyByteArray::new(py, &buffer).into_any().into());
+
+                create_tensor(
+                    &self.framework,
+                    self.info.dtype,
+                    &newshape,
+                    array,
+                    &self.device,
+                )
+            }
             Storage::Torch(storage) => Python::with_gil(|py| -> PyResult<PyObject> {
                 let torch = get_module(py, &TORCH_MODULE)?;
                 let dtype: PyObject = get_pydtype(torch, self.info.dtype, false)?;
                 let torch_uint8: PyObject = get_pydtype(torch, Dtype::U8, false)?;
-                let kwargs = [(intern!(py, "dtype"), torch_uint8)].into_py_dict(py)?;
+                let device: PyObject = self.device.clone().into_pyobject(py)?.into();
+                let kwargs = [
+                    (intern!(py, "dtype"), torch_uint8),
+                    (intern!(py, "device"), device),
+                ]
+                .into_py_dict(py)?;
                 let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
-                let shape = self.info.shape.to_vec();
+                let mut shape = self.info.shape.to_vec();
+                if self.info.dtype == Dtype::F4 {
+                    let n = shape.len();
+                    if shape[n - 1] % 2 != 0 {
+                        return Err(SafetensorError::new_err(format!(
+                    "f4_x2 dtype requires that the last dim be divisible by 2 in torch: got {shape:?}",
+                )));
+                    }
+                    shape[n - 1] /= 2;
+                }
                 let shape: PyObject = shape.into_pyobject(py)?.into();
 
                 let start = (self.info.data_offsets.0 + self.offset) as isize;
@@ -1145,12 +1210,9 @@ impl PySafeSlice {
                     .get()
                     .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
                 let storage: &PyBound<'_, PyAny> = storage.bind(py);
-
                 let storage_slice = storage
                     .getattr(intern!(py, "__getitem__"))?
                     .call1((slice,))?;
-
-                let slices = slices.into_pyobject(py)?;
 
                 let sys = PyModule::import(py, intern!(py, "sys"))?;
                 let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
@@ -1160,130 +1222,46 @@ impl PySafeSlice {
                     .call((storage_slice,), Some(&kwargs))?
                     .getattr(intern!(py, "view"))?
                     .call((), Some(&view_kwargs))?;
-                if byteorder == "big" {
-                    // Important, do NOT use inplace otherwise the slice itself
-                    // is byteswapped, meaning multiple calls will fails
-                    let inplace_kwargs =
-                        [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
 
-                    let intermediary_dtype = match self.info.dtype {
-                        Dtype::BF16 => Some(Dtype::F16),
-                        Dtype::F8_E5M2 => Some(Dtype::U8),
-                        Dtype::F8_E4M3 => Some(Dtype::U8),
-                        Dtype::F8_E8M0 => Some(Dtype::U8),
-                        _ => None,
-                    };
-                    if let Some(intermediary_dtype) = intermediary_dtype {
-                        // Reinterpret to f16 for numpy compatibility.
-                        let dtype: PyObject = get_pydtype(torch, intermediary_dtype, false)?;
-                        let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
-                        tensor = tensor
-                            .getattr(intern!(py, "view"))?
-                            .call((), Some(&view_kwargs))?;
-                    }
-                    let numpy = tensor
-                        .getattr(intern!(py, "numpy"))?
-                        .call0()?
-                        .getattr("byteswap")?
-                        .call((), Some(&inplace_kwargs))?;
-                    tensor = torch.getattr(intern!(py, "from_numpy"))?.call1((numpy,))?;
-                    if intermediary_dtype.is_some() {
-                        // Reinterpret to f16 for numpy compatibility.
-                        let dtype: PyObject = get_pydtype(torch, self.info.dtype, false)?;
-                        let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
-                        tensor = tensor
-                            .getattr(intern!(py, "view"))?
-                            .call((), Some(&view_kwargs))?;
-                    }
-                }
-                tensor = tensor
-                    .getattr(intern!(py, "reshape"))?
-                    .call1((shape,))?
-                    .getattr(intern!(py, "__getitem__"))?
-                    .call1((slices,))?;
-                if self.device != Device::Cpu {
-                    let device: PyObject = self.device.clone().into_pyobject(py)?.into();
-                    let kwargs = PyDict::new(py);
-                    tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
-                }
-                Ok(tensor.into())
-            }),
-            Storage::Paddle(storage) => Python::with_gil(|py| -> PyResult<PyObject> {
-                let paddle = get_module(py, &PADDLE_MODULE)?;
-                let cur_type = if self.info.dtype == Dtype::U16 {
-                    Dtype::BF16
-                } else {
-                    self.info.dtype
-                };
-                let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
-                let paddle_uint8: PyObject = get_pydtype(paddle, Dtype::U8, false)?;
-                let shape = self.info.shape.to_vec();
-                let shape: PyObject = shape.into_pyobject(py)?.into();
-                let start = (self.info.data_offsets.0 + self.offset) as isize;
-                let stop = (self.info.data_offsets.1 + self.offset) as isize;
-                let slices = slices.into_pyobject(py)?;
-                let storage: &PyObject = storage
-                    .get()
-                    .ok_or_else(|| SafetensorError::new_err("Could not find storage"))?;
-                let storage: &PyBound<'_, PyAny> = storage.bind(py);
-                let slice_kwargs = [
-                    (intern!(py, "dtype"), paddle_uint8),
-                    (intern!(py, "start"), start.into_pyobject(py)?.into()),
-                    (intern!(py, "stop"), stop.into_pyobject(py)?.into()),
-                ]
-                .into_py_dict(py)?;
-                let storage_slice = storage
-                    .getattr(intern!(py, "get_slice"))?
-                    .call((), Some(&slice_kwargs))?;
-                let mut tensor = storage_slice
-                    .getattr(intern!(py, "view"))?
-                    .call1((dtype,))?;
-                let sys = PyModule::import(py, intern!(py, "sys"))?;
-                let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
                 if byteorder == "big" {
                     let inplace_kwargs =
                         [(intern!(py, "inplace"), PyBool::new(py, false))].into_py_dict(py)?;
 
-                    let intermediary_dtype = match cur_type {
-                        Dtype::BF16 => Some(Dtype::F16),
-                        Dtype::F8_E5M2 => Some(Dtype::U8),
-                        Dtype::F8_E4M3 => Some(Dtype::U8),
-                        Dtype::F8_E8M0 => Some(Dtype::U8),
-                        _ => None,
-                    };
-                    if let Some(intermediary_dtype) = intermediary_dtype {
-                        // Reinterpret to f16 for numpy compatibility.
-                        let dtype: PyObject = get_pydtype(paddle, intermediary_dtype, false)?;
-                        tensor = tensor.getattr(intern!(py, "view"))?.call1((dtype,))?;
-                    }
-                    let numpy = tensor
-                        .getattr(intern!(py, "numpy"))?
-                        .call0()?
-                        .getattr("byteswap")?
-                        .call((), Some(&inplace_kwargs))?;
-                    tensor = paddle.getattr(intern!(py, "to_tensor"))?.call1((numpy,))?;
-                    if intermediary_dtype.is_some() {
-                        // Reinterpret to f16 for numpy compatibility.
-                        let dtype: PyObject = get_pydtype(paddle, cur_type, false)?;
-                        tensor = tensor.getattr(intern!(py, "view"))?.call1((dtype,))?;
-                    }
+                        let intermediary_dtype = match self.info.dtype {
+                            Dtype::BF16 => Some(Dtype::F16),
+                            Dtype::F8_E5M2 => Some(Dtype::U8),
+                            Dtype::F8_E4M3 => Some(Dtype::U8),
+                            Dtype::F8_E8M0 => Some(Dtype::U8),
+                            _ => None,
+                        };
+                        if let Some(intermediary_dtype) = intermediary_dtype {
+                            // Reinterpret to f16 for numpy compatibility.
+                            let dtype: PyObject = get_pydtype(torch, intermediary_dtype, false)?;
+                            let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
+                            tensor = tensor
+                                .getattr(intern!(py, "view"))?
+                                .call((), Some(&view_kwargs))?;
+                        }
+                        let numpy = tensor
+                            .getattr(intern!(py, "numpy"))?
+                            .call0()?
+                            .getattr("byteswap")?
+                            .call((), Some(&inplace_kwargs))?;
+                        tensor = torch.getattr(intern!(py, "from_numpy"))?.call1((numpy,))?;
+                        if intermediary_dtype.is_some() {
+                            // Reinterpret to f16 for numpy compatibility.
+                            let dtype: PyObject = get_pydtype(torch, self.info.dtype, false)?;
+                            let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict(py)?;
+                            tensor = tensor
+                                .getattr(intern!(py, "view"))?
+                                .call((), Some(&view_kwargs))?;
+                        }
                 }
-                tensor = tensor
-                    .getattr(intern!(py, "reshape"))?
-                    .call1((shape,))?
-                    .getattr(intern!(py, "__getitem__"))?
-                    .call1((slices,))?;
-                if self.device != Device::Cpu {
-                    let device: PyObject = if let Device::Cuda(index) = self.device {
-                        format!("gpu:{index}").into_pyobject(py)?.into()
-                    } else {
-                        self.device.clone().into_pyobject(py)?.into()
-                    };
-                    let kwargs = PyDict::new(py);
-                    tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
-                }
-                Ok(tensor.into())
+
+                tensor = tensor.getattr(intern!(py, "reshape"))?.call1((shape,))?;
+                Ok(tensor.into_pyobject(py)?.into())
             }),
+            Storage::Paddle(_) => todo!(),
         }
     }
 }
@@ -1517,116 +1495,44 @@ impl _safe_open_handle {
         Ok(Self { inner })
     }
 
-    /// Return the special non tensor information in the header
-    ///
-    /// Returns:
-    ///     (`Dict[str, str]`):
-    ///         The freeform metadata.
     pub fn metadata(&self) -> PyResult<Option<HashMap<String, String>>> {
         Ok(self.inner()?.metadata())
     }
 
-    /// Returns the names of the tensors in the file.
-    ///
-    /// Returns:
-    ///     (`List[str]`):
-    ///         The name of the tensors contained in that file
     pub fn keys(&self) -> PyResult<Vec<String>> {
         self.inner()?.keys()
     }
 
-    /// Returns the names of the tensors in the file, ordered by offset.
-    ///
-    /// Returns:
-    ///     (`List[str]`):
-    ///         The name of the tensors contained in that file
     pub fn offset_keys(&self) -> PyResult<Vec<String>> {
         self.inner()?.offset_keys()
     }
 
-    /// Returns a full tensor
-    ///
-    /// Args:
-    ///     name (`str`):
-    ///         The name of the tensor you want
-    ///
-    /// Returns:
-    ///     (`Tensor`):
-    ///         The tensor in the framework you opened the file for.
-    ///
-    /// Example:
-    /// ```python
-    /// from safetensors import safe_open
-    ///
-    /// with safe_open("model.safetensors", framework="pt", device=0) as f:
-    ///     tensor = f.get_tensor("embedding")
-    ///
-    /// ```
     pub fn get_tensor(&self, name: &str) -> PyResult<PyObject> {
         self.inner()?.get_tensor(name)
     }
 
-    /// Returns a full slice view object
-    ///
-    /// Args:
-    ///     name (`str`):
-    ///         The name of the tensor you want
-    ///
-    /// Returns:
-    ///     (`PySafeSlice`):
-    ///         A dummy object you can slice into to get a real tensor
-    /// Example:
-    /// ```python
-    /// from safetensors import safe_open
-    ///
-    /// with safe_open("model.safetensors", framework="pt", device=0) as f:
-    ///     tensor_part = f.get_slice("embedding")[:, ::8]
-    ///
-    /// ```
     pub fn get_slice(&self, name: &str) -> PyResult<PySafeSlice> {
         self.inner()?.get_slice(name)
     }
 
-    /// Start the context manager
     pub fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    /// Exits the context manager
     pub fn __exit__(&mut self, _exc_type: PyObject, _exc_value: PyObject, _traceback: PyObject) {
         self.inner = None;
     }
 }
 
-/// A Python module implemented in Rust.
-#[pymodule(gil_used = false)]
+#[pymodule]
 fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<safe_open>()?;
     m.add_function(wrap_pyfunction!(serialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
-    m.add_class::<safe_open>()?;
+    m.add_function(wrap_pyfunction!(set_decryption_config, m)?)?;
     m.add_class::<_safe_open_handle>()?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn version_parse() {
-        let torch_version = "1.1.1";
-        let version = Version::from_string(torch_version).unwrap();
-        assert_eq!(version, Version::new(1, 1, 1));
-
-        let torch_version = "2.0.0a0+gitd1123c9";
-        let version = Version::from_string(torch_version).unwrap();
-        assert_eq!(version, Version::new(2, 0, 0));
-
-        let torch_version = "something";
-        let version = Version::from_string(torch_version);
-        assert!(version.is_err());
-    }
 }

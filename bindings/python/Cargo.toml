@@ -13,6 +13,10 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.25", features = ["abi3", "abi3-py38"] }
 memmap2 = "0.9"
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+aes = "0.8"
+ctr = "0.9"
+hex = "0.4"
 
 [dependencies.safetensors]
 path = "../../safetensors"
