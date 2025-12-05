@@ -228,23 +228,6 @@ fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String
     Ok(items)
 }
 
-/// Sets the decryption configuration from a JSON string.
-///
-/// Args:
-///     config_json (`str`):
-///         The JSON string containing the encryption configuration.
-///
-/// Returns:
-///     (`NoneType`):
-///         On success return None
-#[pyfunction]
-#[pyo3(signature = (config_json))]
-fn set_decryption_config(config_json: String) -> PyResult<()> {
-    decryption::load_global_config_from_json(&config_json)
-        .map_err(|e| SafetensorError::new_err(format!("Invalid config JSON: {e}")))?;
-    Ok(())
-}
-
 fn slice_to_indexer(
     (dim_idx, (slice_index, dim)): (usize, (SliceIndex, usize)),
 ) -> Result<TensorIndexer, PyErr> {
@@ -1530,7 +1513,6 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serialize, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
-    m.add_function(wrap_pyfunction!(set_decryption_config, m)?)?;
     m.add_class::<_safe_open_handle>()?;
     m.add("SafetensorError", m.py().get_type::<SafetensorError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

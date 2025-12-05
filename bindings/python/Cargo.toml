@@ -17,6 +17,8 @@ serde = { version = "1.0", features = ["derive"] }
 aes = "0.8"
 ctr = "0.9"
 hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
 
 [dependencies.safetensors]
 path = "../../safetensors"
