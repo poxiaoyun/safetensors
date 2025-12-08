@@ -1,10 +1,12 @@
-//! 信封加密解密模块 (AES-256-CTR + KMS)
+//! 信封加密解密模块 (AES / SM4 + KMS)
 //!
 //! 加密文件格式:
 //! - 4 字节: 元数据长度 (big-endian)
-//! - 元数据: JSON {"encryptedKey": "...", "password": "..."}
-//! - 16 字节: IV (用于 AES-256-CTR)
+//! - 元数据: JSON {"encryptedKey": "...", "algorithm": "AES" | "SM4"}
+//! - 16 字节: IV (用于 CTR 模式)
 //! - 剩余部分: 加密后的内容 (支持随机访问解密)
+//!
+//! 密码从环境变量 XPAI_ENC_PASSWORD 获取
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -13,6 +15,7 @@ use std::sync::Mutex;
 use std::env;
 use aes::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use aes::Aes256;
+use sm4::Sm4;
 use ctr::Ctr128BE;
 use serde::Deserialize;
 use pyo3::exceptions::PyFileNotFoundError;
@@ -20,11 +23,29 @@ use pyo3::prelude::*;
 use safetensors::tensor::Metadata;
 use crate::SafetensorError;
 
-type Aes256Ctr = Ctr128BE<Aes256>;
+type AesCtr = Ctr128BE<Aes256>;
+type Sm4Ctr = Ctr128BE<Sm4>;
+
+/// 支持的加密算法
+#[derive(Clone, Debug, PartialEq)]
+enum Algorithm {
+    AES,
+    SM4,
+}
+
+impl Algorithm {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "AES" => Some(Algorithm::AES),
+            "SM4" => Some(Algorithm::SM4),
+            _ => None,
+        }
+    }
+}
 
 /// 元数据长度字段大小 (4 字节)
 const METADATA_LENGTH_SIZE: usize = 4;
-/// IV 大小 (16 字节，用于 AES-256-CTR)
+/// IV 大小 (16 字节，用于 CTR 模式)
 const IV_SIZE: usize = 16;
 
 /// 信封加密文件的元数据
@@ -32,16 +53,18 @@ const IV_SIZE: usize = 16;
 #[serde(rename_all = "camelCase")]
 struct EnvelopeMetadata {
     encrypted_key: String,
-    password: String,
+    algorithm: String,
 }
 
-/// 加密源，包含文件句柄和解密所需的密钥/IV
+/// 加密源，包含文件句柄和解密所需的密钥/IV/算法
 pub struct EncryptedSource {
     pub file: Mutex<File>,
     pub key: Vec<u8>,
     pub iv: Vec<u8>,
     /// 数据区域在文件中的起始偏移 (元数据长度 + 元数据 + IV 之后)
     pub data_offset: usize,
+    /// 加密算法
+    pub algorithm: Algorithm,
 }
 
 /// KMS 客户端配置
@@ -57,7 +80,11 @@ impl KmsClient {
     }
 
     /// 调用 KMS 解密数据密钥
-    fn decrypt_data_key(&self, password: &str, encrypted_key: &str) -> Result<Vec<u8>, String> {
+    fn decrypt_data_key(&self, encrypted_key: &str, algorithm: &str) -> Result<Vec<u8>, String> {
+        // 从环境变量获取密码
+        let password = env::var("XPAI_ENC_PASSWORD")
+            .map_err(|_| "XPAI_ENC_PASSWORD environment variable not set")?;
+
         let url = format!("{}/api/kms/decrypt-data-key", self.base_url);
 
         let client = reqwest::blocking::Client::new();
@@ -66,7 +93,8 @@ impl KmsClient {
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "password": password,
-                "encryptedKey": encrypted_key
+                "encryptedKey": encrypted_key,
+                "algorithm": algorithm
             }))
             .send()
             .map_err(|e| format!("KMS request failed: {e}"))?;
@@ -152,15 +180,27 @@ pub fn create_encrypted_source(filename: &Path) -> PyResult<Option<(usize, Metad
         }
     };
 
+    // 解析算法
+    let algorithm = Algorithm::from_str(&envelope_meta.algorithm)
+        .ok_or_else(|| SafetensorError::new_err(format!(
+            "Unsupported algorithm: {}. Supported: AES, SM4",
+            envelope_meta.algorithm
+        )))?;
+
     // 调用 KMS 解密数据密钥
     let kms = KmsClient::new();
-    let key = kms.decrypt_data_key(&envelope_meta.password, &envelope_meta.encrypted_key)
+    let key = kms.decrypt_data_key(&envelope_meta.encrypted_key, &envelope_meta.algorithm)
         .map_err(|e| SafetensorError::new_err(format!("KMS decryption failed: {e}")))?;
 
-    if key.len() != 32 {
+    // 验证密钥长度
+    let expected_key_len = match algorithm {
+        Algorithm::AES => 32,
+        Algorithm::SM4 => 16,
+    };
+    if key.len() != expected_key_len {
         return Err(SafetensorError::new_err(format!(
-            "Invalid key length: expected 32 bytes, got {}",
-            key.len()
+            "Invalid key length for {}: expected {} bytes, got {}",
+            envelope_meta.algorithm, expected_key_len, key.len()
         )));
     }
 
@@ -170,11 +210,8 @@ pub fn create_encrypted_source(filename: &Path) -> PyResult<Option<(usize, Metad
         SafetensorError::new_err(format!("Error reading size: {e}"))
     })?;
 
-    // 解密 size
-    let mut cipher = Aes256Ctr::new_from_slices(&key, &iv).map_err(|e| {
-        SafetensorError::new_err(format!("Error creating cipher: {e}"))
-    })?;
-    cipher.apply_keystream(&mut size_buffer);
+    // 解密 size（根据算法选择）
+    decrypt_block(&key, &iv, &mut size_buffer, 0, &algorithm)?;
 
     let n = u64::from_le_bytes(size_buffer) as usize;
 
@@ -196,8 +233,8 @@ pub fn create_encrypted_source(filename: &Path) -> PyResult<Option<(usize, Metad
         SafetensorError::new_err(format!("Error reading header: {e}"))
     })?;
 
-    // cipher 状态自动继续
-    cipher.apply_keystream(&mut header_buffer);
+    // 解密 header（偏移 8 字节，即 size 字段之后）
+    decrypt_block(&key, &iv, &mut header_buffer, 8, &algorithm)?;
 
     // 解析 safetensors metadata
     let metadata: Metadata = serde_json::from_slice(&header_buffer).map_err(|e| {
@@ -209,9 +246,39 @@ pub fn create_encrypted_source(filename: &Path) -> PyResult<Option<(usize, Metad
         key,
         iv,
         data_offset,
+        algorithm,
     };
 
     Ok(Some((n, metadata, source)))
+}
+
+/// 使用指定算法解密数据块
+fn decrypt_block(key: &[u8], iv: &[u8], buffer: &mut [u8], offset: u64, algorithm: &Algorithm) -> PyResult<()> {
+    match algorithm {
+        Algorithm::AES => {
+            let mut cipher = AesCtr::new_from_slices(key, iv).map_err(|e| {
+                SafetensorError::new_err(format!("Error creating AES cipher: {e}"))
+            })?;
+            if offset > 0 {
+                cipher.try_seek(offset).map_err(|e| {
+                    SafetensorError::new_err(format!("Error seeking AES cipher: {e}"))
+                })?;
+            }
+            cipher.apply_keystream(buffer);
+        }
+        Algorithm::SM4 => {
+            let mut cipher = Sm4Ctr::new_from_slices(key, iv).map_err(|e| {
+                SafetensorError::new_err(format!("Error creating SM4 cipher: {e}"))
+            })?;
+            if offset > 0 {
+                cipher.try_seek(offset).map_err(|e| {
+                    SafetensorError::new_err(format!("Error seeking SM4 cipher: {e}"))
+                })?;
+            }
+            cipher.apply_keystream(buffer);
+        }
+    }
+    Ok(())
 }
 
 /// 解密连续的字节范围
@@ -238,13 +305,7 @@ pub fn decrypt_buffer(source: &EncryptedSource, start: usize, len: usize) -> PyR
         })?;
     }
 
-    let mut cipher = Aes256Ctr::new_from_slices(&source.key, &source.iv).map_err(|e| {
-        SafetensorError::new_err(format!("Error creating cipher: {e}"))
-    })?;
-    cipher.try_seek(cipher_offset).map_err(|e| {
-        SafetensorError::new_err(format!("Error seeking cipher: {e}"))
-    })?;
-    cipher.apply_keystream(&mut buffer);
+    decrypt_block(&source.key, &source.iv, &mut buffer, cipher_offset, &source.algorithm)?;
 
     Ok(buffer)
 }
@@ -264,12 +325,10 @@ pub fn decrypt_slices(source: &EncryptedSource, tensor_start_offset: usize, indi
             SafetensorError::new_err("Failed to lock file")
         })?;
 
-        for (start, stop) in indices {
+        for (start, stop) in &indices {
             let len = stop - start;
             // 文件中的实际位置
             let file_offset = (source.data_offset + tensor_start_offset + start) as u64;
-            // cipher 的 seek 位置（相对于加密开始）
-            let cipher_offset = (tensor_start_offset + start) as u64;
 
             file.seek(SeekFrom::Start(file_offset)).map_err(|e| {
                 SafetensorError::new_err(format!("Error seeking file: {e}"))
@@ -279,19 +338,25 @@ pub fn decrypt_slices(source: &EncryptedSource, tensor_start_offset: usize, indi
                 SafetensorError::new_err(format!("Error reading file: {e}"))
             })?;
 
-            // 解密这个块
-            let mut cipher = Aes256Ctr::new_from_slices(&source.key, &source.iv).map_err(|e| {
-                SafetensorError::new_err(format!("Error creating cipher: {e}"))
-            })?;
-
-            cipher.try_seek(cipher_offset).map_err(|e| {
-                SafetensorError::new_err(format!("Error seeking cipher: {e}"))
-            })?;
-
-            cipher.apply_keystream(&mut buffer[buffer_offset..buffer_offset + len]);
-
             buffer_offset += len;
         }
+    }
+
+    // 解密所有块
+    buffer_offset = 0;
+    for (start, stop) in indices {
+        let len = stop - start;
+        let cipher_offset = (tensor_start_offset + start) as u64;
+
+        decrypt_block(
+            &source.key,
+            &source.iv,
+            &mut buffer[buffer_offset..buffer_offset + len],
+            cipher_offset,
+            &source.algorithm
+        )?;
+
+        buffer_offset += len;
     }
 
     Ok(buffer)
